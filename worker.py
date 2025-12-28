@@ -77,27 +77,69 @@ def get_npm_token():
         return None
 
 def get_container_mappings():
+    """
+    Interacts with the Docker Daemon to find containers with exposed ports.
+    
+    Supported Labels:
+      - mdns.port.expose=none        : Ignored completely.
+      - mdns.port.expose=80,3000     : Only exposes ports 80 and 3000, in that specific order.
+    """
     try:
         client = docker.from_env()
         container_map = []
         
         for container in client.containers.list():
             ports = container.attrs['NetworkSettings']['Ports']
+            labels = container.attrs['Config']['Labels']
+            
             if not ports:
                 continue
                 
             container_name = container.name
             clean_name = re.sub(r'[^a-zA-Z0-9-]', '', container_name)
             
-            exposed_ports = []
+            # 1. Gather all physically exposed ports on the host
+            actual_exposed_ports = set()
             for port_proto, host_bindings in ports.items():
                 if host_bindings:
-                    exposed_ports.append(int(host_bindings[0]['HostPort']))
+                    actual_exposed_ports.add(int(host_bindings[0]['HostPort']))
             
-            exposed_ports.sort()
+            if not actual_exposed_ports:
+                continue
+
+            # 2. Check for "mdns.port.expose" Label
+            expose_label = labels.get('mdns.port.expose', '').lower().strip()
             
-            for i, port in enumerate(exposed_ports):
+            final_ports = []
+
+            if expose_label == 'none':
+                # User explicitly requested NO mDNS for this container
+                continue
+            
+            elif expose_label:
+                # User provided a specific list/order: "8080,3000"
+                try:
+                    # Parse the csv list
+                    requested_ports = [int(p.strip()) for p in expose_label.split(',') if p.strip().isdigit()]
+                    
+                    # Only include ports that are ACTUALLY exposed (validation)
+                    for p in requested_ports:
+                        if p in actual_exposed_ports:
+                            final_ports.append(p)
+                            
+                except ValueError:
+                    logger(f"Invalid label format for {container_name}: {expose_label}", is_error=True)
+                    # Fallback to default behavior if parsing fails
+                    final_ports = sorted(list(actual_exposed_ports))
+            else:
+                # Default Behavior: Expose all, sorted numerically
+                final_ports = sorted(list(actual_exposed_ports))
+
+            # 3. Generate mappings
+            for i, port in enumerate(final_ports):
+                # The first port in the list gets the clean name
                 suffix = f"_{i}" if i > 0 else ""
+                
                 hostname_full = f"{clean_name}{suffix}.{HOSTNAME}.local"
                 
                 container_map.append({
